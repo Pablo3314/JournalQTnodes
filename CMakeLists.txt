@@ -27,6 +27,7 @@ if(${QT_VERSION_MAJOR} GREATER_EQUAL 6)
         MANUAL_FINALIZATION
         ${PROJECT_SOURCES}
         initialtour.h initialtour.cpp initialtour.ui
+        canvaswidget.h canvaswidget.cpp
 
     )
 # Define target properties for Android with Qt 6 as:

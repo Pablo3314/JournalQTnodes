@@ -1,13 +1,12 @@
-#ifndef MAINWINDOW_H
-#define MAINWINDOW_H
+#pragma once
 
 #include <QMainWindow>
 
 QT_BEGIN_NAMESPACE
-namespace Ui {
-class MainWindow;
-}
+namespace Ui { class MainWindow; }
 QT_END_NAMESPACE
+
+class CanvasWidget;
 
 class MainWindow : public QMainWindow
 {
@@ -15,9 +14,12 @@ class MainWindow : public QMainWindow
 
 public:
     explicit MainWindow(QWidget *parent = nullptr);
-    ~MainWindow() override;
+    ~MainWindow();
+
+protected:
+    void resizeEvent(QResizeEvent *event) override;
 
 private:
     Ui::MainWindow *ui;
+    CanvasWidget *canvas = nullptr;
 };
-#endif // MAINWINDOW_H
