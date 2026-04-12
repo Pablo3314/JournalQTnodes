@@ -15,7 +15,10 @@ class CanvasWidget : public QWidget
 
 private:
     QPixmap m_cache;
-    bool m_cacheDirty = true;
+    QRectF m_cacheWorldBounds;
+    qreal m_cacheZoom = 0.0;
+    QPointF m_cachePan;
+    bool m_cacheValid = false;
 
 public:
     explicit CanvasWidget(QWidget *parent = nullptr);
@@ -73,4 +76,8 @@ private:
 
     QString defaultProjectFolder() const;
     QString strokeFilePath(int strokeId) const;
+
+    void invalidateCache();
+    bool isCacheValid(const QRectF &visibleWorld) const;
+    void renderStrokes(QPainter &p, const QRectF &visibleWorld);
 };
