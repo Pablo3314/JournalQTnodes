@@ -13,6 +13,7 @@
 #include <QJsonArray>
 #include <QDirIterator>
 #include <QFileInfo>
+#include <QTimer>
 #include <QtMath>
 #include <algorithm>
 
@@ -44,6 +45,12 @@ CanvasWidget::CanvasWidget(QWidget *parent)
 
     m_projectFolder = defaultProjectFolder();
     QDir().mkpath(m_projectFolder + "/strokes");
+
+    m_metaSaveTimer = new QTimer(this);
+    m_metaSaveTimer->setSingleShot(true);
+    connect(m_metaSaveTimer, &QTimer::timeout, this, [this]() {
+        saveMeta();
+    });
 
     QFile metaFile(m_projectFolder + "/meta.json");
     if (metaFile.exists()) {
@@ -101,22 +108,17 @@ void CanvasWidget::renderStrokes(QPainter &p, const QRectF &visibleWorld)
     const QVector<int> candidates = queryCandidateStrokes(visibleWorld);
 
     auto drawStroke = [&p](const Stroke &s) {
-        if (s.points.size() < 2) {
+        if (s.points.size() < 2 || s.path.isEmpty()) {
             return;
         }
 
         QPen pen(s.color);
         pen.setWidthF(s.width);
-        pen.setCosmetic(true);  // Ensures constant visual width regardless of zoom
+        pen.setCosmetic(true);
         pen.setCapStyle(Qt::RoundCap);
         pen.setJoinStyle(Qt::RoundJoin);
         p.setPen(pen);
-
-        QPainterPath path(s.points.first());
-        for (int i = 1; i < s.points.size(); ++i) {
-            path.lineTo(s.points[i]);
-        }
-        p.drawPath(path);
+        p.drawPath(s.path);
     };
 
     for (int idx : candidates) {
@@ -139,8 +141,47 @@ void CanvasWidget::clearAll()
     m_drawing = false;
     m_panning = false;
     m_nextStrokeId = 1;
+    m_lastStrokeUpdateWorldRect = QRectF();
     invalidateCache();
     update();
+}
+
+QPainterPath CanvasWidget::buildSmoothPath(const QVector<QPointF> &points) const
+{
+    QPainterPath path;
+    if (points.isEmpty()) {
+        return path;
+    }
+
+    path.moveTo(points.first());
+    if (points.size() == 1) {
+        return path;
+    }
+    if (points.size() == 2) {
+        path.lineTo(points.last());
+        return path;
+    }
+
+    for (int i = 1; i < points.size() - 1; ++i) {
+        const QPointF mid = (points[i] + points[i + 1]) * 0.5;
+        path.quadTo(points[i], mid);
+    }
+    path.lineTo(points.last());
+    return path;
+}
+
+QRect CanvasWidget::updateRectForWorld(const QRectF &worldRect, qreal extraPixels) const
+{
+    if (!worldRect.isValid() || worldRect.isEmpty()) {
+        return rect();
+    }
+
+    QRectF screenRect(worldRect.left() * m_zoom + m_pan.x(),
+                      worldRect.top() * m_zoom + m_pan.y(),
+                      worldRect.width() * m_zoom,
+                      worldRect.height() * m_zoom);
+    screenRect = screenRect.normalized().adjusted(-extraPixels, -extraPixels, extraPixels, extraPixels);
+    return screenRect.toAlignedRect();
 }
 
 QRectF CanvasWidget::computeStrokeBounds(const Stroke &stroke) const
@@ -219,13 +260,14 @@ void CanvasWidget::appendPointToCurrentStroke(const QPointF &worldPoint)
     if (m_currentStroke.points.isEmpty()) {
         m_currentStroke.points.append(worldPoint);
         m_currentStroke.bounds = QRectF(worldPoint, QSizeF(0, 0));
+        m_currentStroke.path = buildSmoothPath(m_currentStroke.points);
+        m_lastStrokeUpdateWorldRect = m_currentStroke.bounds;
         return;
     }
 
     const QPointF last = m_currentStroke.points.last();
-    // Fixed minimum distance in world coordinates (independent of zoom)
-    // This ensures maximum resolution without excessive RAM usage
-    const qreal minDist = 0.5;
+    const qreal minScreenDist = 0.75;
+    const qreal minDist = qMax<qreal>(0.02, minScreenDist / qMax<qreal>(m_zoom, 0.001));
     const qreal dx = worldPoint.x() - last.x();
     const qreal dy = worldPoint.y() - last.y();
 
@@ -235,6 +277,8 @@ void CanvasWidget::appendPointToCurrentStroke(const QPointF &worldPoint)
 
     m_currentStroke.points.append(worldPoint);
     m_currentStroke.bounds = m_currentStroke.bounds.united(QRectF(worldPoint, QSizeF(0, 0)));
+    m_currentStroke.path = buildSmoothPath(m_currentStroke.points);
+    m_lastStrokeUpdateWorldRect = m_lastStrokeUpdateWorldRect.united(QRectF(worldPoint, QSizeF(0, 0)));
     
     // Invalidate cache when drawing to ensure real-time updates
     invalidateCache();
@@ -248,6 +292,7 @@ void CanvasWidget::finishCurrentStroke()
     }
 
     m_currentStroke.bounds = computeStrokeBounds(m_currentStroke);
+    m_currentStroke.path = buildSmoothPath(m_currentStroke.points);
 
     const int id = m_nextStrokeId++;
     m_strokes.append(m_currentStroke);
@@ -256,9 +301,17 @@ void CanvasWidget::finishCurrentStroke()
     saveMeta();
 
     m_currentStroke = Stroke{};
+    m_lastStrokeUpdateWorldRect = QRectF();
     
     // Invalidate cache after finishing stroke
     invalidateCache();
+}
+
+void CanvasWidget::scheduleMetaSave()
+{
+    if (m_metaSaveTimer) {
+        m_metaSaveTimer->start(200);
+    }
 }
 
 void CanvasWidget::mousePressEvent(QMouseEvent *event)
@@ -272,8 +325,9 @@ void CanvasWidget::mousePressEvent(QMouseEvent *event)
         m_currentStroke.color = Qt::white;
         m_currentStroke.width = 2.0;
         appendPointToCurrentStroke(worldPos);
+        m_lastStrokeUpdateWorldRect = QRectF(worldPos, QSizeF(0, 0));
         grabMouse();
-        update();
+        update(updateRectForWorld(m_lastStrokeUpdateWorldRect));
         event->accept();
         return;
     }
@@ -295,8 +349,13 @@ void CanvasWidget::mouseMoveEvent(QMouseEvent *event)
     const QPointF pos = mousePosFromMouseEvent(event);
 
     if (m_drawing && (event->buttons() & Qt::LeftButton)) {
-        appendPointToCurrentStroke(screenToWorld(pos));
-        update();
+        const QPointF world = screenToWorld(pos);
+        const int oldCount = m_currentStroke.points.size();
+        appendPointToCurrentStroke(world);
+        if (m_currentStroke.points.size() != oldCount) {
+            update(updateRectForWorld(m_lastStrokeUpdateWorldRect));
+            m_lastStrokeUpdateWorldRect = QRectF(world, QSizeF(0, 0));
+        }
         event->accept();
         return;
     }
@@ -305,8 +364,8 @@ void CanvasWidget::mouseMoveEvent(QMouseEvent *event)
         const QPointF delta = pos - m_lastMousePos;
         m_pan += delta;
         m_lastMousePos = pos;
-        saveMeta();
         update();
+        scheduleMetaSave();
         event->accept();
         return;
     }
@@ -352,7 +411,7 @@ void CanvasWidget::wheelEvent(QWheelEvent *event)
     // Invalidate cache on zoom change
     invalidateCache();
     
-    saveMeta();
+    scheduleMetaSave();
     update();
 
     event->accept();
@@ -380,22 +439,17 @@ void CanvasWidget::paintEvent(QPaintEvent *)
     // Draw current stroke being drawn
     if (m_drawing) {
         auto drawStroke = [&p](const Stroke &s) {
-            if (s.points.size() < 2) {
+            if (s.points.size() < 2 || s.path.isEmpty()) {
                 return;
             }
 
             QPen pen(s.color);
             pen.setWidthF(s.width);
-            pen.setCosmetic(true);  // Constant visual width regardless of zoom
+            pen.setCosmetic(true);
             pen.setCapStyle(Qt::RoundCap);
             pen.setJoinStyle(Qt::RoundJoin);
             p.setPen(pen);
-
-            QPainterPath path(s.points.first());
-            for (int i = 1; i < s.points.size(); ++i) {
-                path.lineTo(s.points[i]);
-            }
-            p.drawPath(path);
+            p.drawPath(s.path);
         };
         drawStroke(m_currentStroke);
     }
@@ -522,6 +576,7 @@ bool CanvasWidget::loadProject(const QString &folderPath)
     for (const QString &filePath : files) {
         Stroke s;
         if (loadStrokeFile(filePath, s)) {
+            s.path = buildSmoothPath(s.points);
             m_strokes.append(s);
         }
     }

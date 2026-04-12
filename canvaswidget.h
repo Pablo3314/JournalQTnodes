@@ -8,6 +8,9 @@
 #include <QPointF>
 #include <QRectF>
 #include <QString>
+#include <QPainterPath>
+
+class QTimer;
 
 class CanvasWidget : public QWidget
 {
@@ -40,6 +43,7 @@ private:
         QColor color = Qt::black;
         qreal width = 2.0;
         QRectF bounds;
+        QPainterPath path;
     };
 
     QVector<Stroke> m_strokes;
@@ -52,9 +56,11 @@ private:
     qreal m_zoom = 1.0;
 
     QPointF m_lastMousePos;
+    QRectF m_lastStrokeUpdateWorldRect;
 
     QString m_projectFolder;
     int m_nextStrokeId = 1;
+    QTimer *m_metaSaveTimer = nullptr;
 
     static constexpr qreal GRID_SIZE = 1200.0;
     QHash<qint64, QVector<int>> m_gridIndex;
@@ -70,6 +76,9 @@ private:
 
     void appendPointToCurrentStroke(const QPointF &worldPoint);
     void finishCurrentStroke();
+    void scheduleMetaSave();
+    QPainterPath buildSmoothPath(const QVector<QPointF> &points) const;
+    QRect updateRectForWorld(const QRectF &worldRect, qreal extraPixels = 6.0) const;
 
     void saveStrokeFile(int strokeId, const Stroke &stroke) const;
     bool loadStrokeFile(const QString &filePath, Stroke &stroke) const;
