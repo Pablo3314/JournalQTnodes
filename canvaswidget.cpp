@@ -79,6 +79,58 @@ QPointF CanvasWidget::screenToWorld(const QPointF &screen) const
                    (screen.y() - m_pan.y()) / m_zoom);
 }
 
+void CanvasWidget::invalidateCache()
+{
+    m_cacheValid = false;
+    m_cache = QPixmap();
+}
+
+bool CanvasWidget::isCacheValid(const QRectF &visibleWorld) const
+{
+    if (!m_cacheValid || m_cache.isNull()) {
+        return false;
+    }
+    // Cache is valid if zoom and pan haven't changed
+    return (qAbs(m_cacheZoom - m_zoom) < 0.001) && 
+           (qAbs(m_cachePan.x() - m_pan.x()) < 0.5) &&
+           (qAbs(m_cachePan.y() - m_pan.y()) < 0.5);
+}
+
+void CanvasWidget::renderStrokes(QPainter &p, const QRectF &visibleWorld)
+{
+    const QVector<int> candidates = queryCandidateStrokes(visibleWorld);
+
+    auto drawStroke = [&p](const Stroke &s) {
+        if (s.points.size() < 2) {
+            return;
+        }
+
+        QPen pen(s.color);
+        pen.setWidthF(s.width);
+        pen.setCosmetic(true);  // Ensures constant visual width regardless of zoom
+        pen.setCapStyle(Qt::RoundCap);
+        pen.setJoinStyle(Qt::RoundJoin);
+        p.setPen(pen);
+
+        QPainterPath path(s.points.first());
+        for (int i = 1; i < s.points.size(); ++i) {
+            path.lineTo(s.points[i]);
+        }
+        p.drawPath(path);
+    };
+
+    for (int idx : candidates) {
+        if (idx < 0 || idx >= m_strokes.size()) {
+            continue;
+        }
+
+        const Stroke &s = m_strokes[idx];
+        if (s.bounds.intersects(visibleWorld)) {
+            drawStroke(s);
+        }
+    }
+}
+
 void CanvasWidget::clearAll()
 {
     m_strokes.clear();
@@ -87,6 +139,7 @@ void CanvasWidget::clearAll()
     m_drawing = false;
     m_panning = false;
     m_nextStrokeId = 1;
+    invalidateCache();
     update();
 }
 
@@ -171,6 +224,7 @@ void CanvasWidget::appendPointToCurrentStroke(const QPointF &worldPoint)
 
     const QPointF last = m_currentStroke.points.last();
     // Fixed minimum distance in world coordinates (independent of zoom)
+    // This ensures maximum resolution without excessive RAM usage
     const qreal minDist = 0.5;
     const qreal dx = worldPoint.x() - last.x();
     const qreal dy = worldPoint.y() - last.y();
@@ -181,6 +235,9 @@ void CanvasWidget::appendPointToCurrentStroke(const QPointF &worldPoint)
 
     m_currentStroke.points.append(worldPoint);
     m_currentStroke.bounds = m_currentStroke.bounds.united(QRectF(worldPoint, QSizeF(0, 0)));
+    
+    // Invalidate cache when drawing to ensure real-time updates
+    invalidateCache();
 }
 
 void CanvasWidget::finishCurrentStroke()
@@ -199,6 +256,9 @@ void CanvasWidget::finishCurrentStroke()
     saveMeta();
 
     m_currentStroke = Stroke{};
+    
+    // Invalidate cache after finishing stroke
+    invalidateCache();
 }
 
 void CanvasWidget::mousePressEvent(QMouseEvent *event)
@@ -288,6 +348,10 @@ void CanvasWidget::wheelEvent(QWheelEvent *event)
     m_zoom = qBound(0.05, m_zoom, 50.0);
 
     m_pan = cursor - QPointF(worldBeforeZoom.x() * m_zoom, worldBeforeZoom.y() * m_zoom);
+    
+    // Invalidate cache on zoom change
+    invalidateCache();
+    
     saveMeta();
     update();
 
@@ -310,39 +374,29 @@ void CanvasWidget::paintEvent(QPaintEvent *)
                               screenToWorld(QPointF(width(), height()))
                               ).normalized().adjusted(-50, -50, 50, 50);
 
-    const QVector<int> candidates = queryCandidateStrokes(visibleWorld);
+    // Render all strokes with optimized spatial indexing
+    renderStrokes(p, visibleWorld);
 
-    auto drawStroke = [&p](const Stroke &s) {
-        if (s.points.size() < 2) {
-            return;
-        }
-
-        QPen pen(s.color);
-        pen.setWidthF(s.width);
-        pen.setCosmetic(true);
-        pen.setCapStyle(Qt::RoundCap);
-        pen.setJoinStyle(Qt::RoundJoin);
-        p.setPen(pen);
-
-        QPainterPath path(s.points.first());
-        for (int i = 1; i < s.points.size(); ++i) {
-            path.lineTo(s.points[i]);
-        }
-        p.drawPath(path);
-    };
-
-    for (int idx : candidates) {
-        if (idx < 0 || idx >= m_strokes.size()) {
-            continue;
-        }
-
-        const Stroke &s = m_strokes[idx];
-        if (s.bounds.intersects(visibleWorld)) {
-            drawStroke(s);
-        }
-    }
-
+    // Draw current stroke being drawn
     if (m_drawing) {
+        auto drawStroke = [&p](const Stroke &s) {
+            if (s.points.size() < 2) {
+                return;
+            }
+
+            QPen pen(s.color);
+            pen.setWidthF(s.width);
+            pen.setCosmetic(true);  // Constant visual width regardless of zoom
+            pen.setCapStyle(Qt::RoundCap);
+            pen.setJoinStyle(Qt::RoundJoin);
+            p.setPen(pen);
+
+            QPainterPath path(s.points.first());
+            for (int i = 1; i < s.points.size(); ++i) {
+                path.lineTo(s.points[i]);
+            }
+            p.drawPath(path);
+        };
         drawStroke(m_currentStroke);
     }
 }

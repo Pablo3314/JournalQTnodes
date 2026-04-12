@@ -1,1 +1,20 @@
-Nothing should be ignored based on the provided file changes, as only a source code file (`canvaswidget.cpp`) was modified without any build artifacts, dependencies, or temporary files being present in the changes.
+```
+# CMake build artifacts
+build/
+CMakeCache.txt
+CMakeFiles/
+
+# Qt/MOC generated files
+*_autogen/
+moc_*.cpp
+moc_*.h
+ui_*.h
+
+# Executables
+Nodes
+
+# Temporary build files
+*.o
+*.d
+*.log
+```

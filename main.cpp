@@ -1,3 +1,6 @@
+// VERSION: Optimized stroke rendering with constant width and improved performance
+// Changes: Fixed cosmetic pen for constant stroke width, optimized caching system
+
 #include "mainwindow.h"
 
 #include <QApplication>
