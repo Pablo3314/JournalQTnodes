@@ -170,7 +170,8 @@ void CanvasWidget::appendPointToCurrentStroke(const QPointF &worldPoint)
     }
 
     const QPointF last = m_currentStroke.points.last();
-    const qreal minDist = 0.8 / m_zoom;
+    // Fixed minimum distance in world coordinates (independent of zoom)
+    const qreal minDist = 0.5;
     const qreal dx = worldPoint.x() - last.x();
     const qreal dy = worldPoint.y() - last.y();
 
