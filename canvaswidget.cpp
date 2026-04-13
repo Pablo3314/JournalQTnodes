@@ -106,19 +106,22 @@ bool CanvasWidget::isCacheValid(const QRectF &visibleWorld) const
 void CanvasWidget::renderStrokes(QPainter &p, const QRectF &visibleWorld)
 {
     const QVector<int> candidates = queryCandidateStrokes(visibleWorld);
+    QTransform worldToScreen;
+    worldToScreen.translate(m_pan.x(), m_pan.y());
+    worldToScreen.scale(m_zoom, m_zoom);
 
-    auto drawStroke = [&p](const Stroke &s) {
+    auto drawStroke = [&p, &worldToScreen](const Stroke &s) {
         if (s.points.size() < 2 || s.path.isEmpty()) {
             return;
         }
 
         QPen pen(s.color);
         pen.setWidthF(s.width);
-        pen.setCosmetic(true);
+        pen.setCosmetic(false);
         pen.setCapStyle(Qt::RoundCap);
         pen.setJoinStyle(Qt::RoundJoin);
         p.setPen(pen);
-        p.drawPath(s.path);
+        p.drawPath(worldToScreen.map(s.path));
     };
 
     for (int idx : candidates) {
@@ -168,20 +171,6 @@ QPainterPath CanvasWidget::buildSmoothPath(const QVector<QPointF> &points) const
     }
     path.lineTo(points.last());
     return path;
-}
-
-QRect CanvasWidget::updateRectForWorld(const QRectF &worldRect, qreal extraPixels) const
-{
-    if (!worldRect.isValid() || worldRect.isEmpty()) {
-        return rect();
-    }
-
-    QRectF screenRect(worldRect.left() * m_zoom + m_pan.x(),
-                      worldRect.top() * m_zoom + m_pan.y(),
-                      worldRect.width() * m_zoom,
-                      worldRect.height() * m_zoom);
-    screenRect = screenRect.normalized().adjusted(-extraPixels, -extraPixels, extraPixels, extraPixels);
-    return screenRect.toAlignedRect();
 }
 
 QRectF CanvasWidget::computeStrokeBounds(const Stroke &stroke) const
@@ -260,8 +249,7 @@ void CanvasWidget::appendPointToCurrentStroke(const QPointF &worldPoint)
     if (m_currentStroke.points.isEmpty()) {
         m_currentStroke.points.append(worldPoint);
         m_currentStroke.bounds = QRectF(worldPoint, QSizeF(0, 0));
-        m_currentStroke.path = buildSmoothPath(m_currentStroke.points);
-        m_lastStrokeUpdateWorldRect = m_currentStroke.bounds;
+        m_currentStroke.path = QPainterPath(worldPoint);
         return;
     }
 
@@ -277,8 +265,7 @@ void CanvasWidget::appendPointToCurrentStroke(const QPointF &worldPoint)
 
     m_currentStroke.points.append(worldPoint);
     m_currentStroke.bounds = m_currentStroke.bounds.united(QRectF(worldPoint, QSizeF(0, 0)));
-    m_currentStroke.path = buildSmoothPath(m_currentStroke.points);
-    m_lastStrokeUpdateWorldRect = m_lastStrokeUpdateWorldRect.united(QRectF(worldPoint, QSizeF(0, 0)));
+    m_currentStroke.path.lineTo(worldPoint);
     
     // Invalidate cache when drawing to ensure real-time updates
     invalidateCache();
@@ -353,8 +340,7 @@ void CanvasWidget::mouseMoveEvent(QMouseEvent *event)
         const int oldCount = m_currentStroke.points.size();
         appendPointToCurrentStroke(world);
         if (m_currentStroke.points.size() != oldCount) {
-            update(updateRectForWorld(m_lastStrokeUpdateWorldRect));
-            m_lastStrokeUpdateWorldRect = QRectF(world, QSizeF(0, 0));
+            update();
         }
         event->accept();
         return;
@@ -423,33 +409,35 @@ void CanvasWidget::paintEvent(QPaintEvent *)
     p.fillRect(rect(), Qt::black);
     p.setRenderHint(QPainter::Antialiasing, true);
 
-    QTransform t;
-    t.translate(m_pan.x(), m_pan.y());
-    t.scale(m_zoom, m_zoom);
-    p.setTransform(t);
-
-    QRectF visibleWorld = QRectF(
+    const QRectF visibleWorld = QRectF(
                               screenToWorld(QPointF(0, 0)),
                               screenToWorld(QPointF(width(), height()))
-                              ).normalized().adjusted(-50, -50, 50, 50);
+                              ).normalized();
+    const qreal viewPadWorld = qMax<qreal>(2000.0, 4000.0 / qMax<qreal>(m_zoom, 0.001));
+    const QRectF paddedVisibleWorld = visibleWorld.adjusted(-viewPadWorld, -viewPadWorld,
+                                                            viewPadWorld, viewPadWorld);
 
     // Render all strokes with optimized spatial indexing
-    renderStrokes(p, visibleWorld);
+    renderStrokes(p, paddedVisibleWorld);
 
     // Draw current stroke being drawn
     if (m_drawing) {
-        auto drawStroke = [&p](const Stroke &s) {
+        QTransform worldToScreen;
+        worldToScreen.translate(m_pan.x(), m_pan.y());
+        worldToScreen.scale(m_zoom, m_zoom);
+
+        auto drawStroke = [&p, &worldToScreen](const Stroke &s) {
             if (s.points.size() < 2 || s.path.isEmpty()) {
                 return;
             }
 
             QPen pen(s.color);
             pen.setWidthF(s.width);
-            pen.setCosmetic(true);
+            pen.setCosmetic(false);
             pen.setCapStyle(Qt::RoundCap);
             pen.setJoinStyle(Qt::RoundJoin);
             p.setPen(pen);
-            p.drawPath(s.path);
+            p.drawPath(worldToScreen.map(s.path));
         };
         drawStroke(m_currentStroke);
     }

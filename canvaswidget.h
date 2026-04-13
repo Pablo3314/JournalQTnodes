@@ -78,7 +78,6 @@ private:
     void finishCurrentStroke();
     void scheduleMetaSave();
     QPainterPath buildSmoothPath(const QVector<QPointF> &points) const;
-    QRect updateRectForWorld(const QRectF &worldRect, qreal extraPixels = 6.0) const;
 
     void saveStrokeFile(int strokeId, const Stroke &stroke) const;
     bool loadStrokeFile(const QString &filePath, Stroke &stroke) const;
