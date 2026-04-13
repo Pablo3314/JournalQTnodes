@@ -56,6 +56,7 @@ private:
     qreal m_zoom = 1.0;
 
     QPointF m_lastMousePos;
+    QRectF m_lastStrokeUpdateWorldRect;
 
     QString m_projectFolder;
     int m_nextStrokeId = 1;
