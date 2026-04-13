@@ -2,8 +2,11 @@
 
 #include <QPainter>
 #include <QPainterPath>
+#include <QTransform>
 #include <QMouseEvent>
 #include <QWheelEvent>
+#include <QKeyEvent>
+#include <QTabletEvent>
 #include <QStandardPaths>
 #include <QDir>
 #include <QFile>
@@ -27,6 +30,15 @@ static QPointF mousePosFromMouseEvent(QMouseEvent *event)
 }
 
 static QPointF mousePosFromWheelEvent(QWheelEvent *event)
+{
+#if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
+    return event->position();
+#else
+    return event->posF();
+#endif
+}
+
+static QPointF posFromTabletEvent(QTabletEvent *event)
 {
 #if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
     return event->position();
@@ -94,6 +106,7 @@ void CanvasWidget::invalidateCache()
 
 bool CanvasWidget::isCacheValid(const QRectF &visibleWorld) const
 {
+    Q_UNUSED(visibleWorld);
     if (!m_cacheValid || m_cache.isNull()) {
         return false;
     }
@@ -134,6 +147,152 @@ void CanvasWidget::renderStrokes(QPainter &p, const QRectF &visibleWorld)
             drawStroke(s);
         }
     }
+}
+
+bool CanvasWidget::isEraserButton(Qt::MouseButton button)
+{
+    return button == Qt::ExtraButton1 || button == Qt::BackButton || button == Qt::ForwardButton;
+}
+
+bool CanvasWidget::isAnyEraserButtonPressed(Qt::MouseButtons buttons)
+{
+    return buttons.testFlag(Qt::ExtraButton1) || buttons.testFlag(Qt::BackButton) || buttons.testFlag(Qt::ForwardButton);
+}
+
+bool CanvasWidget::isEraserMode() const
+{
+    return m_eraserKeyHeld || m_eraserButtonHeld;
+}
+
+qreal CanvasWidget::currentEraserRadiusPixels() const
+{
+    const qreal clampedPressure = qBound<qreal>(0.0, m_lastTabletPressure, 1.0);
+    return 10.0 + (30.0 * clampedPressure);
+}
+
+QVector<CanvasWidget::Stroke> CanvasWidget::eraseStrokeSegments(const Stroke &stroke,
+                                                                const QPointF &center,
+                                                                qreal radiusWorld,
+                                                                bool &changed) const
+{
+    QVector<Stroke> segments;
+    if (stroke.points.size() < 2) {
+        changed = false;
+        segments.append(stroke);
+        return segments;
+    }
+
+    const qreal r2 = radiusWorld * radiusWorld;
+    auto isOutside = [&](const QPointF &p) {
+        const qreal dx = p.x() - center.x();
+        const qreal dy = p.y() - center.y();
+        return (dx * dx + dy * dy) > r2;
+    };
+
+    QVector<QPointF> current;
+    bool removedAnyPoint = false;
+
+    for (const QPointF &p : stroke.points) {
+        if (isOutside(p)) {
+            current.append(p);
+            continue;
+        }
+
+        removedAnyPoint = true;
+        if (current.size() >= 2) {
+            Stroke piece;
+            piece.color = stroke.color;
+            piece.width = stroke.width;
+            piece.points = current;
+            piece.bounds = computeStrokeBounds(piece);
+            piece.path = buildSmoothPath(piece.points);
+            segments.append(piece);
+        }
+        current.clear();
+    }
+
+    if (current.size() >= 2) {
+        Stroke piece;
+        piece.color = stroke.color;
+        piece.width = stroke.width;
+        piece.points = current;
+        piece.bounds = computeStrokeBounds(piece);
+        piece.path = buildSmoothPath(piece.points);
+        segments.append(piece);
+    }
+
+    changed = removedAnyPoint;
+    if (!changed) {
+        segments.clear();
+        segments.append(stroke);
+    }
+    return segments;
+}
+
+bool CanvasWidget::eraseAt(const QPointF &worldCenter, qreal radiusWorld)
+{
+    const QRectF eraserRect(worldCenter.x() - radiusWorld,
+                            worldCenter.y() - radiusWorld,
+                            radiusWorld * 2.0,
+                            radiusWorld * 2.0);
+
+    const QVector<int> candidates = queryCandidateStrokes(eraserRect.adjusted(-radiusWorld, -radiusWorld,
+                                                                               radiusWorld, radiusWorld));
+    if (candidates.isEmpty()) {
+        return false;
+    }
+
+    QSet<int> candidateSet;
+    for (int idx : candidates) {
+        candidateSet.insert(idx);
+    }
+    QVector<Stroke> rebuilt;
+    rebuilt.reserve(m_strokes.size());
+
+    bool changedAny = false;
+
+    for (int i = 0; i < m_strokes.size(); ++i) {
+        const Stroke &stroke = m_strokes[i];
+        if (!candidateSet.contains(i) || !stroke.bounds.intersects(eraserRect)) {
+            rebuilt.append(stroke);
+            continue;
+        }
+
+        bool changed = false;
+        QVector<Stroke> pieces = eraseStrokeSegments(stroke, worldCenter, radiusWorld, changed);
+        if (changed) {
+            changedAny = true;
+            for (const Stroke &piece : pieces) {
+                rebuilt.append(piece);
+            }
+        } else {
+            rebuilt.append(stroke);
+        }
+    }
+
+    if (!changedAny) {
+        return false;
+    }
+
+    m_strokes = std::move(rebuilt);
+    rebuildIndex();
+    invalidateCache();
+    return true;
+}
+
+void CanvasWidget::rewriteAllStrokeFiles()
+{
+    QDir strokesRoot(m_projectFolder + "/strokes");
+    if (strokesRoot.exists()) {
+        strokesRoot.removeRecursively();
+    }
+    QDir().mkpath(m_projectFolder + "/strokes");
+
+    m_nextStrokeId = 1;
+    for (const Stroke &stroke : m_strokes) {
+        saveStrokeFile(m_nextStrokeId++, stroke);
+    }
+    saveMeta();
 }
 
 void CanvasWidget::clearAll()
@@ -305,6 +464,29 @@ void CanvasWidget::mousePressEvent(QMouseEvent *event)
 {
     const QPointF pos = mousePosFromMouseEvent(event);
     const QPointF worldPos = screenToWorld(pos);
+    m_pointerScreenPos = pos;
+    m_pointerValid = true;
+
+    if (isEraserButton(event->button())) {
+        m_eraserButtonHeld = true;
+        const qreal radiusWorld = currentEraserRadiusPixels() / qMax<qreal>(m_zoom, 0.001);
+        if (eraseAt(worldPos, radiusWorld)) {
+            m_eraseDirty = true;
+            update();
+        }
+        event->accept();
+        return;
+    }
+
+    if (m_eraserKeyHeld && event->button() == Qt::LeftButton) {
+        const qreal radiusWorld = currentEraserRadiusPixels() / qMax<qreal>(m_zoom, 0.001);
+        if (eraseAt(worldPos, radiusWorld)) {
+            m_eraseDirty = true;
+            update();
+        }
+        event->accept();
+        return;
+    }
 
     if (event->button() == Qt::LeftButton) {
         m_drawing = true;
@@ -334,6 +516,20 @@ void CanvasWidget::mousePressEvent(QMouseEvent *event)
 void CanvasWidget::mouseMoveEvent(QMouseEvent *event)
 {
     const QPointF pos = mousePosFromMouseEvent(event);
+    m_pointerScreenPos = pos;
+    m_pointerValid = true;
+
+    if (m_eraserButtonHeld || (m_eraserKeyHeld && (event->buttons() & Qt::LeftButton))) {
+        const qreal radiusWorld = currentEraserRadiusPixels() / qMax<qreal>(m_zoom, 0.001);
+        if (eraseAt(screenToWorld(pos), radiusWorld)) {
+            m_eraseDirty = true;
+            update();
+        } else if (isEraserMode()) {
+            update();
+        }
+        event->accept();
+        return;
+    }
 
     if (m_drawing && (event->buttons() & Qt::LeftButton)) {
         const QPointF world = screenToWorld(pos);
@@ -361,6 +557,22 @@ void CanvasWidget::mouseMoveEvent(QMouseEvent *event)
 
 void CanvasWidget::mouseReleaseEvent(QMouseEvent *event)
 {
+    m_pointerScreenPos = mousePosFromMouseEvent(event);
+    m_pointerValid = true;
+
+    if (isEraserButton(event->button()) || (m_eraserKeyHeld && event->button() == Qt::LeftButton)) {
+        if (isEraserButton(event->button())) {
+            m_eraserButtonHeld = false;
+        }
+        if (m_eraseDirty) {
+            rewriteAllStrokeFiles();
+            m_eraseDirty = false;
+        }
+        update();
+        event->accept();
+        return;
+    }
+
     if (event->button() == Qt::LeftButton && m_drawing) {
         m_drawing = false;
         finishCurrentStroke();
@@ -403,6 +615,62 @@ void CanvasWidget::wheelEvent(QWheelEvent *event)
     event->accept();
 }
 
+void CanvasWidget::keyPressEvent(QKeyEvent *event)
+{
+    if (!event->isAutoRepeat() && event->key() == Qt::Key_B) {
+        m_eraserKeyHeld = true;
+        update();
+        event->accept();
+        return;
+    }
+
+    QWidget::keyPressEvent(event);
+}
+
+void CanvasWidget::keyReleaseEvent(QKeyEvent *event)
+{
+    if (!event->isAutoRepeat() && event->key() == Qt::Key_B) {
+        m_eraserKeyHeld = false;
+        if (m_eraseDirty) {
+            rewriteAllStrokeFiles();
+            m_eraseDirty = false;
+        }
+        update();
+        event->accept();
+        return;
+    }
+
+    QWidget::keyReleaseEvent(event);
+}
+
+void CanvasWidget::tabletEvent(QTabletEvent *event)
+{
+    const QPointF pos = posFromTabletEvent(event);
+    m_pointerScreenPos = pos;
+    m_pointerValid = true;
+    m_lastTabletPressure = event->pressure();
+
+    const bool eraserBtnDown = isAnyEraserButtonPressed(event->buttons()) || isEraserButton(static_cast<Qt::MouseButton>(event->button()));
+    m_eraserButtonHeld = eraserBtnDown;
+
+    const bool tipDown = event->buttons().testFlag(Qt::LeftButton);
+    if (m_eraserButtonHeld || (m_eraserKeyHeld && tipDown)) {
+        const qreal radiusWorld = currentEraserRadiusPixels() / qMax<qreal>(m_zoom, 0.001);
+        if (eraseAt(screenToWorld(pos), radiusWorld)) {
+            m_eraseDirty = true;
+        }
+        update();
+        if (event->type() == QEvent::TabletRelease && m_eraseDirty) {
+            rewriteAllStrokeFiles();
+            m_eraseDirty = false;
+        }
+        event->accept();
+        return;
+    }
+
+    QWidget::tabletEvent(event);
+}
+
 void CanvasWidget::paintEvent(QPaintEvent *)
 {
     QPainter p(this);
@@ -440,6 +708,15 @@ void CanvasWidget::paintEvent(QPaintEvent *)
             p.drawPath(worldToScreen.map(s.path));
         };
         drawStroke(m_currentStroke);
+    }
+
+    if (m_pointerValid && isEraserMode()) {
+        const qreal r = currentEraserRadiusPixels();
+        QColor fill(255, 255, 255, 55);
+        QColor edge(255, 255, 255, 170);
+        p.setBrush(fill);
+        p.setPen(QPen(edge, 1.5));
+        p.drawEllipse(m_pointerScreenPos, r, r);
     }
 }
 
