@@ -8,6 +8,11 @@
 #include <QPointF>
 #include <QRectF>
 #include <QString>
+#include <QPainterPath>
+
+class QTimer;
+class QKeyEvent;
+class QTabletEvent;
 
 class CanvasWidget : public QWidget
 {
@@ -33,6 +38,9 @@ protected:
     void mouseMoveEvent(QMouseEvent *event) override;
     void mouseReleaseEvent(QMouseEvent *event) override;
     void wheelEvent(QWheelEvent *event) override;
+    void keyPressEvent(QKeyEvent *event) override;
+    void keyReleaseEvent(QKeyEvent *event) override;
+    void tabletEvent(QTabletEvent *event) override;
 
 private:
     struct Stroke {
@@ -40,6 +48,7 @@ private:
         QColor color = Qt::black;
         qreal width = 2.0;
         QRectF bounds;
+        QPainterPath path;
     };
 
     QVector<Stroke> m_strokes;
@@ -52,9 +61,17 @@ private:
     qreal m_zoom = 1.0;
 
     QPointF m_lastMousePos;
+    QPointF m_pointerScreenPos;
+    bool m_pointerValid = false;
+
+    bool m_eraserKeyHeld = false;
+    bool m_eraserButtonHeld = false;
+    bool m_eraseDirty = false;
+    qreal m_lastTabletPressure = 1.0;
 
     QString m_projectFolder;
     int m_nextStrokeId = 1;
+    QTimer *m_metaSaveTimer = nullptr;
 
     static constexpr qreal GRID_SIZE = 1200.0;
     QHash<qint64, QVector<int>> m_gridIndex;
@@ -70,6 +87,16 @@ private:
 
     void appendPointToCurrentStroke(const QPointF &worldPoint);
     void finishCurrentStroke();
+    void scheduleMetaSave();
+    QPainterPath buildSmoothPath(const QVector<QPointF> &points) const;
+    bool eraseAt(const QPointF &worldCenter, qreal radiusWorld);
+    QVector<Stroke> eraseStrokeSegments(const Stroke &stroke, const QPointF &center, qreal radiusWorld, bool &changed) const;
+    void rewriteAllStrokeFiles();
+
+    bool isEraserMode() const;
+    static bool isEraserButton(Qt::MouseButton button);
+    static bool isAnyEraserButtonPressed(Qt::MouseButtons buttons);
+    qreal currentEraserRadiusPixels() const;
 
     void saveStrokeFile(int strokeId, const Stroke &stroke) const;
     bool loadStrokeFile(const QString &filePath, Stroke &stroke) const;

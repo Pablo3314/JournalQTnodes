@@ -2,8 +2,11 @@
 
 #include <QPainter>
 #include <QPainterPath>
+#include <QTransform>
 #include <QMouseEvent>
 #include <QWheelEvent>
+#include <QKeyEvent>
+#include <QTabletEvent>
 #include <QStandardPaths>
 #include <QDir>
 #include <QFile>
@@ -13,6 +16,7 @@
 #include <QJsonArray>
 #include <QDirIterator>
 #include <QFileInfo>
+#include <QTimer>
 #include <QtMath>
 #include <algorithm>
 
@@ -34,6 +38,15 @@ static QPointF mousePosFromWheelEvent(QWheelEvent *event)
 #endif
 }
 
+static QPointF posFromTabletEvent(QTabletEvent *event)
+{
+#if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
+    return event->position();
+#else
+    return event->posF();
+#endif
+}
+
 CanvasWidget::CanvasWidget(QWidget *parent)
     : QWidget(parent)
 {
@@ -44,6 +57,12 @@ CanvasWidget::CanvasWidget(QWidget *parent)
 
     m_projectFolder = defaultProjectFolder();
     QDir().mkpath(m_projectFolder + "/strokes");
+
+    m_metaSaveTimer = new QTimer(this);
+    m_metaSaveTimer->setSingleShot(true);
+    connect(m_metaSaveTimer, &QTimer::timeout, this, [this]() {
+        saveMeta();
+    });
 
     QFile metaFile(m_projectFolder + "/meta.json");
     if (metaFile.exists()) {
@@ -87,6 +106,7 @@ void CanvasWidget::invalidateCache()
 
 bool CanvasWidget::isCacheValid(const QRectF &visibleWorld) const
 {
+    Q_UNUSED(visibleWorld);
     if (!m_cacheValid || m_cache.isNull()) {
         return false;
     }
@@ -99,24 +119,22 @@ bool CanvasWidget::isCacheValid(const QRectF &visibleWorld) const
 void CanvasWidget::renderStrokes(QPainter &p, const QRectF &visibleWorld)
 {
     const QVector<int> candidates = queryCandidateStrokes(visibleWorld);
+    QTransform worldToScreen;
+    worldToScreen.translate(m_pan.x(), m_pan.y());
+    worldToScreen.scale(m_zoom, m_zoom);
 
-    auto drawStroke = [&p](const Stroke &s) {
-        if (s.points.size() < 2) {
+    auto drawStroke = [&p, &worldToScreen](const Stroke &s) {
+        if (s.points.size() < 2 || s.path.isEmpty()) {
             return;
         }
 
         QPen pen(s.color);
         pen.setWidthF(s.width);
-        pen.setCosmetic(true);  // Ensures constant visual width regardless of zoom
+        pen.setCosmetic(false);
         pen.setCapStyle(Qt::RoundCap);
         pen.setJoinStyle(Qt::RoundJoin);
         p.setPen(pen);
-
-        QPainterPath path(s.points.first());
-        for (int i = 1; i < s.points.size(); ++i) {
-            path.lineTo(s.points[i]);
-        }
-        p.drawPath(path);
+        p.drawPath(worldToScreen.map(s.path));
     };
 
     for (int idx : candidates) {
@@ -131,6 +149,152 @@ void CanvasWidget::renderStrokes(QPainter &p, const QRectF &visibleWorld)
     }
 }
 
+bool CanvasWidget::isEraserButton(Qt::MouseButton button)
+{
+    return button == Qt::ExtraButton1 || button == Qt::BackButton || button == Qt::ForwardButton;
+}
+
+bool CanvasWidget::isAnyEraserButtonPressed(Qt::MouseButtons buttons)
+{
+    return buttons.testFlag(Qt::ExtraButton1) || buttons.testFlag(Qt::BackButton) || buttons.testFlag(Qt::ForwardButton);
+}
+
+bool CanvasWidget::isEraserMode() const
+{
+    return m_eraserKeyHeld || m_eraserButtonHeld;
+}
+
+qreal CanvasWidget::currentEraserRadiusPixels() const
+{
+    const qreal clampedPressure = qBound<qreal>(0.0, m_lastTabletPressure, 1.0);
+    return 10.0 + (30.0 * clampedPressure);
+}
+
+QVector<CanvasWidget::Stroke> CanvasWidget::eraseStrokeSegments(const Stroke &stroke,
+                                                                const QPointF &center,
+                                                                qreal radiusWorld,
+                                                                bool &changed) const
+{
+    QVector<Stroke> segments;
+    if (stroke.points.size() < 2) {
+        changed = false;
+        segments.append(stroke);
+        return segments;
+    }
+
+    const qreal r2 = radiusWorld * radiusWorld;
+    auto isOutside = [&](const QPointF &p) {
+        const qreal dx = p.x() - center.x();
+        const qreal dy = p.y() - center.y();
+        return (dx * dx + dy * dy) > r2;
+    };
+
+    QVector<QPointF> current;
+    bool removedAnyPoint = false;
+
+    for (const QPointF &p : stroke.points) {
+        if (isOutside(p)) {
+            current.append(p);
+            continue;
+        }
+
+        removedAnyPoint = true;
+        if (current.size() >= 2) {
+            Stroke piece;
+            piece.color = stroke.color;
+            piece.width = stroke.width;
+            piece.points = current;
+            piece.bounds = computeStrokeBounds(piece);
+            piece.path = buildSmoothPath(piece.points);
+            segments.append(piece);
+        }
+        current.clear();
+    }
+
+    if (current.size() >= 2) {
+        Stroke piece;
+        piece.color = stroke.color;
+        piece.width = stroke.width;
+        piece.points = current;
+        piece.bounds = computeStrokeBounds(piece);
+        piece.path = buildSmoothPath(piece.points);
+        segments.append(piece);
+    }
+
+    changed = removedAnyPoint;
+    if (!changed) {
+        segments.clear();
+        segments.append(stroke);
+    }
+    return segments;
+}
+
+bool CanvasWidget::eraseAt(const QPointF &worldCenter, qreal radiusWorld)
+{
+    const QRectF eraserRect(worldCenter.x() - radiusWorld,
+                            worldCenter.y() - radiusWorld,
+                            radiusWorld * 2.0,
+                            radiusWorld * 2.0);
+
+    const QVector<int> candidates = queryCandidateStrokes(eraserRect.adjusted(-radiusWorld, -radiusWorld,
+                                                                               radiusWorld, radiusWorld));
+    if (candidates.isEmpty()) {
+        return false;
+    }
+
+    QSet<int> candidateSet;
+    for (int idx : candidates) {
+        candidateSet.insert(idx);
+    }
+    QVector<Stroke> rebuilt;
+    rebuilt.reserve(m_strokes.size());
+
+    bool changedAny = false;
+
+    for (int i = 0; i < m_strokes.size(); ++i) {
+        const Stroke &stroke = m_strokes[i];
+        if (!candidateSet.contains(i) || !stroke.bounds.intersects(eraserRect)) {
+            rebuilt.append(stroke);
+            continue;
+        }
+
+        bool changed = false;
+        QVector<Stroke> pieces = eraseStrokeSegments(stroke, worldCenter, radiusWorld, changed);
+        if (changed) {
+            changedAny = true;
+            for (const Stroke &piece : pieces) {
+                rebuilt.append(piece);
+            }
+        } else {
+            rebuilt.append(stroke);
+        }
+    }
+
+    if (!changedAny) {
+        return false;
+    }
+
+    m_strokes = std::move(rebuilt);
+    rebuildIndex();
+    invalidateCache();
+    return true;
+}
+
+void CanvasWidget::rewriteAllStrokeFiles()
+{
+    QDir strokesRoot(m_projectFolder + "/strokes");
+    if (strokesRoot.exists()) {
+        strokesRoot.removeRecursively();
+    }
+    QDir().mkpath(m_projectFolder + "/strokes");
+
+    m_nextStrokeId = 1;
+    for (const Stroke &stroke : m_strokes) {
+        saveStrokeFile(m_nextStrokeId++, stroke);
+    }
+    saveMeta();
+}
+
 void CanvasWidget::clearAll()
 {
     m_strokes.clear();
@@ -141,6 +305,30 @@ void CanvasWidget::clearAll()
     m_nextStrokeId = 1;
     invalidateCache();
     update();
+}
+
+QPainterPath CanvasWidget::buildSmoothPath(const QVector<QPointF> &points) const
+{
+    QPainterPath path;
+    if (points.isEmpty()) {
+        return path;
+    }
+
+    path.moveTo(points.first());
+    if (points.size() == 1) {
+        return path;
+    }
+    if (points.size() == 2) {
+        path.lineTo(points.last());
+        return path;
+    }
+
+    for (int i = 1; i < points.size() - 1; ++i) {
+        const QPointF mid = (points[i] + points[i + 1]) * 0.5;
+        path.quadTo(points[i], mid);
+    }
+    path.lineTo(points.last());
+    return path;
 }
 
 QRectF CanvasWidget::computeStrokeBounds(const Stroke &stroke) const
@@ -219,13 +407,13 @@ void CanvasWidget::appendPointToCurrentStroke(const QPointF &worldPoint)
     if (m_currentStroke.points.isEmpty()) {
         m_currentStroke.points.append(worldPoint);
         m_currentStroke.bounds = QRectF(worldPoint, QSizeF(0, 0));
+        m_currentStroke.path = QPainterPath(worldPoint);
         return;
     }
 
     const QPointF last = m_currentStroke.points.last();
-    // Fixed minimum distance in world coordinates (independent of zoom)
-    // This ensures maximum resolution without excessive RAM usage
-    const qreal minDist = 0.5;
+    const qreal minScreenDist = 0.75;
+    const qreal minDist = qMax<qreal>(0.02, minScreenDist / qMax<qreal>(m_zoom, 0.001));
     const qreal dx = worldPoint.x() - last.x();
     const qreal dy = worldPoint.y() - last.y();
 
@@ -235,6 +423,7 @@ void CanvasWidget::appendPointToCurrentStroke(const QPointF &worldPoint)
 
     m_currentStroke.points.append(worldPoint);
     m_currentStroke.bounds = m_currentStroke.bounds.united(QRectF(worldPoint, QSizeF(0, 0)));
+    m_currentStroke.path.lineTo(worldPoint);
     
     // Invalidate cache when drawing to ensure real-time updates
     invalidateCache();
@@ -248,6 +437,7 @@ void CanvasWidget::finishCurrentStroke()
     }
 
     m_currentStroke.bounds = computeStrokeBounds(m_currentStroke);
+    m_currentStroke.path = buildSmoothPath(m_currentStroke.points);
 
     const int id = m_nextStrokeId++;
     m_strokes.append(m_currentStroke);
@@ -261,10 +451,40 @@ void CanvasWidget::finishCurrentStroke()
     invalidateCache();
 }
 
+void CanvasWidget::scheduleMetaSave()
+{
+    if (m_metaSaveTimer) {
+        m_metaSaveTimer->start(200);
+    }
+}
+
 void CanvasWidget::mousePressEvent(QMouseEvent *event)
 {
     const QPointF pos = mousePosFromMouseEvent(event);
     const QPointF worldPos = screenToWorld(pos);
+    m_pointerScreenPos = pos;
+    m_pointerValid = true;
+
+    if (isEraserButton(event->button())) {
+        m_eraserButtonHeld = true;
+        const qreal radiusWorld = currentEraserRadiusPixels() / qMax<qreal>(m_zoom, 0.001);
+        if (eraseAt(worldPos, radiusWorld)) {
+            m_eraseDirty = true;
+            update();
+        }
+        event->accept();
+        return;
+    }
+
+    if (m_eraserKeyHeld && event->button() == Qt::LeftButton) {
+        const qreal radiusWorld = currentEraserRadiusPixels() / qMax<qreal>(m_zoom, 0.001);
+        if (eraseAt(worldPos, radiusWorld)) {
+            m_eraseDirty = true;
+            update();
+        }
+        event->accept();
+        return;
+    }
 
     if (event->button() == Qt::LeftButton) {
         m_drawing = true;
@@ -293,10 +513,28 @@ void CanvasWidget::mousePressEvent(QMouseEvent *event)
 void CanvasWidget::mouseMoveEvent(QMouseEvent *event)
 {
     const QPointF pos = mousePosFromMouseEvent(event);
+    m_pointerScreenPos = pos;
+    m_pointerValid = true;
+
+    if (m_eraserButtonHeld || (m_eraserKeyHeld && (event->buttons() & Qt::LeftButton))) {
+        const qreal radiusWorld = currentEraserRadiusPixels() / qMax<qreal>(m_zoom, 0.001);
+        if (eraseAt(screenToWorld(pos), radiusWorld)) {
+            m_eraseDirty = true;
+            update();
+        } else if (isEraserMode()) {
+            update();
+        }
+        event->accept();
+        return;
+    }
 
     if (m_drawing && (event->buttons() & Qt::LeftButton)) {
-        appendPointToCurrentStroke(screenToWorld(pos));
-        update();
+        const QPointF world = screenToWorld(pos);
+        const int oldCount = m_currentStroke.points.size();
+        appendPointToCurrentStroke(world);
+        if (m_currentStroke.points.size() != oldCount) {
+            update();
+        }
         event->accept();
         return;
     }
@@ -305,8 +543,8 @@ void CanvasWidget::mouseMoveEvent(QMouseEvent *event)
         const QPointF delta = pos - m_lastMousePos;
         m_pan += delta;
         m_lastMousePos = pos;
-        saveMeta();
         update();
+        scheduleMetaSave();
         event->accept();
         return;
     }
@@ -316,6 +554,22 @@ void CanvasWidget::mouseMoveEvent(QMouseEvent *event)
 
 void CanvasWidget::mouseReleaseEvent(QMouseEvent *event)
 {
+    m_pointerScreenPos = mousePosFromMouseEvent(event);
+    m_pointerValid = true;
+
+    if (isEraserButton(event->button()) || (m_eraserKeyHeld && event->button() == Qt::LeftButton)) {
+        if (isEraserButton(event->button())) {
+            m_eraserButtonHeld = false;
+        }
+        if (m_eraseDirty) {
+            rewriteAllStrokeFiles();
+            m_eraseDirty = false;
+        }
+        update();
+        event->accept();
+        return;
+    }
+
     if (event->button() == Qt::LeftButton && m_drawing) {
         m_drawing = false;
         finishCurrentStroke();
@@ -352,10 +606,66 @@ void CanvasWidget::wheelEvent(QWheelEvent *event)
     // Invalidate cache on zoom change
     invalidateCache();
     
-    saveMeta();
+    scheduleMetaSave();
     update();
 
     event->accept();
+}
+
+void CanvasWidget::keyPressEvent(QKeyEvent *event)
+{
+    if (!event->isAutoRepeat() && event->key() == Qt::Key_B) {
+        m_eraserKeyHeld = true;
+        update();
+        event->accept();
+        return;
+    }
+
+    QWidget::keyPressEvent(event);
+}
+
+void CanvasWidget::keyReleaseEvent(QKeyEvent *event)
+{
+    if (!event->isAutoRepeat() && event->key() == Qt::Key_B) {
+        m_eraserKeyHeld = false;
+        if (m_eraseDirty) {
+            rewriteAllStrokeFiles();
+            m_eraseDirty = false;
+        }
+        update();
+        event->accept();
+        return;
+    }
+
+    QWidget::keyReleaseEvent(event);
+}
+
+void CanvasWidget::tabletEvent(QTabletEvent *event)
+{
+    const QPointF pos = posFromTabletEvent(event);
+    m_pointerScreenPos = pos;
+    m_pointerValid = true;
+    m_lastTabletPressure = event->pressure();
+
+    const bool eraserBtnDown = isAnyEraserButtonPressed(event->buttons()) || isEraserButton(static_cast<Qt::MouseButton>(event->button()));
+    m_eraserButtonHeld = eraserBtnDown;
+
+    const bool tipDown = event->buttons().testFlag(Qt::LeftButton);
+    if (m_eraserButtonHeld || (m_eraserKeyHeld && tipDown)) {
+        const qreal radiusWorld = currentEraserRadiusPixels() / qMax<qreal>(m_zoom, 0.001);
+        if (eraseAt(screenToWorld(pos), radiusWorld)) {
+            m_eraseDirty = true;
+        }
+        update();
+        if (event->type() == QEvent::TabletRelease && m_eraseDirty) {
+            rewriteAllStrokeFiles();
+            m_eraseDirty = false;
+        }
+        event->accept();
+        return;
+    }
+
+    QWidget::tabletEvent(event);
 }
 
 void CanvasWidget::paintEvent(QPaintEvent *)
@@ -364,40 +674,46 @@ void CanvasWidget::paintEvent(QPaintEvent *)
     p.fillRect(rect(), Qt::black);
     p.setRenderHint(QPainter::Antialiasing, true);
 
-    QTransform t;
-    t.translate(m_pan.x(), m_pan.y());
-    t.scale(m_zoom, m_zoom);
-    p.setTransform(t);
-
-    QRectF visibleWorld = QRectF(
+    const QRectF visibleWorld = QRectF(
                               screenToWorld(QPointF(0, 0)),
                               screenToWorld(QPointF(width(), height()))
-                              ).normalized().adjusted(-50, -50, 50, 50);
+                              ).normalized();
+    const qreal viewPadWorld = qMax<qreal>(2000.0, 4000.0 / qMax<qreal>(m_zoom, 0.001));
+    const QRectF paddedVisibleWorld = visibleWorld.adjusted(-viewPadWorld, -viewPadWorld,
+                                                            viewPadWorld, viewPadWorld);
 
     // Render all strokes with optimized spatial indexing
-    renderStrokes(p, visibleWorld);
+    renderStrokes(p, paddedVisibleWorld);
 
     // Draw current stroke being drawn
     if (m_drawing) {
-        auto drawStroke = [&p](const Stroke &s) {
-            if (s.points.size() < 2) {
+        QTransform worldToScreen;
+        worldToScreen.translate(m_pan.x(), m_pan.y());
+        worldToScreen.scale(m_zoom, m_zoom);
+
+        auto drawStroke = [&p, &worldToScreen](const Stroke &s) {
+            if (s.points.size() < 2 || s.path.isEmpty()) {
                 return;
             }
 
             QPen pen(s.color);
             pen.setWidthF(s.width);
-            pen.setCosmetic(true);  // Constant visual width regardless of zoom
+            pen.setCosmetic(false);
             pen.setCapStyle(Qt::RoundCap);
             pen.setJoinStyle(Qt::RoundJoin);
             p.setPen(pen);
-
-            QPainterPath path(s.points.first());
-            for (int i = 1; i < s.points.size(); ++i) {
-                path.lineTo(s.points[i]);
-            }
-            p.drawPath(path);
+            p.drawPath(worldToScreen.map(s.path));
         };
         drawStroke(m_currentStroke);
+    }
+
+    if (m_pointerValid && isEraserMode()) {
+        const qreal r = currentEraserRadiusPixels();
+        QColor fill(255, 255, 255, 55);
+        QColor edge(255, 255, 255, 170);
+        p.setBrush(fill);
+        p.setPen(QPen(edge, 1.5));
+        p.drawEllipse(m_pointerScreenPos, r, r);
     }
 }
 
@@ -522,6 +838,7 @@ bool CanvasWidget::loadProject(const QString &folderPath)
     for (const QString &filePath : files) {
         Stroke s;
         if (loadStrokeFile(filePath, s)) {
+            s.path = buildSmoothPath(s.points);
             m_strokes.append(s);
         }
     }
