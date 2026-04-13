@@ -303,6 +303,7 @@ void CanvasWidget::clearAll()
     m_drawing = false;
     m_panning = false;
     m_nextStrokeId = 1;
+    m_lastStrokeUpdateWorldRect = QRectF();
     invalidateCache();
     update();
 }
@@ -446,6 +447,7 @@ void CanvasWidget::finishCurrentStroke()
     saveMeta();
 
     m_currentStroke = Stroke{};
+    m_lastStrokeUpdateWorldRect = QRectF();
     
     // Invalidate cache after finishing stroke
     invalidateCache();
@@ -492,8 +494,9 @@ void CanvasWidget::mousePressEvent(QMouseEvent *event)
         m_currentStroke.color = Qt::white;
         m_currentStroke.width = 2.0;
         appendPointToCurrentStroke(worldPos);
+        m_lastStrokeUpdateWorldRect = QRectF(worldPos, QSizeF(0, 0));
         grabMouse();
-        update();
+        update(updateRectForWorld(m_lastStrokeUpdateWorldRect));
         event->accept();
         return;
     }

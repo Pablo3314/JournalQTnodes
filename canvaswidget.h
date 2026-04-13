@@ -11,8 +11,6 @@
 #include <QPainterPath>
 
 class QTimer;
-class QKeyEvent;
-class QTabletEvent;
 
 class CanvasWidget : public QWidget
 {
@@ -61,13 +59,7 @@ private:
     qreal m_zoom = 1.0;
 
     QPointF m_lastMousePos;
-    QPointF m_pointerScreenPos;
-    bool m_pointerValid = false;
-
-    bool m_eraserKeyHeld = false;
-    bool m_eraserButtonHeld = false;
-    bool m_eraseDirty = false;
-    qreal m_lastTabletPressure = 1.0;
+    QRectF m_lastStrokeUpdateWorldRect;
 
     QString m_projectFolder;
     int m_nextStrokeId = 1;
@@ -89,14 +81,6 @@ private:
     void finishCurrentStroke();
     void scheduleMetaSave();
     QPainterPath buildSmoothPath(const QVector<QPointF> &points) const;
-    bool eraseAt(const QPointF &worldCenter, qreal radiusWorld);
-    QVector<Stroke> eraseStrokeSegments(const Stroke &stroke, const QPointF &center, qreal radiusWorld, bool &changed) const;
-    void rewriteAllStrokeFiles();
-
-    bool isEraserMode() const;
-    static bool isEraserButton(Qt::MouseButton button);
-    static bool isAnyEraserButtonPressed(Qt::MouseButtons buttons);
-    qreal currentEraserRadiusPixels() const;
 
     void saveStrokeFile(int strokeId, const Stroke &stroke) const;
     bool loadStrokeFile(const QString &filePath, Stroke &stroke) const;
