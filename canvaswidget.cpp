@@ -98,6 +98,20 @@ QPointF CanvasWidget::screenToWorld(const QPointF &screen) const
                    (screen.y() - m_pan.y()) / m_zoom);
 }
 
+QRect CanvasWidget::updateRectForWorld(const QRectF &worldRect) const
+{
+    if (!worldRect.isValid() || worldRect.isEmpty()) {
+        return rect();
+    }
+
+    QRectF screenRect(worldRect.left() * m_zoom + m_pan.x(),
+                      worldRect.top() * m_zoom + m_pan.y(),
+                      worldRect.width() * m_zoom,
+                      worldRect.height() * m_zoom);
+    screenRect = screenRect.normalized().adjusted(-6.0, -6.0, 6.0, 6.0);
+    return screenRect.toAlignedRect();
+}
+
 void CanvasWidget::invalidateCache()
 {
     m_cacheValid = false;
@@ -123,13 +137,13 @@ void CanvasWidget::renderStrokes(QPainter &p, const QRectF &visibleWorld)
     worldToScreen.translate(m_pan.x(), m_pan.y());
     worldToScreen.scale(m_zoom, m_zoom);
 
-    auto drawStroke = [&p, &worldToScreen](const Stroke &s) {
+    auto drawStroke = [this, &p, &worldToScreen](const Stroke &s) {
         if (s.points.size() < 2 || s.path.isEmpty()) {
             return;
         }
 
         QPen pen(s.color);
-        pen.setWidthF(s.width);
+        pen.setWidthF(s.width * m_zoom);  // Scale width by zoom to maintain world-space width
         pen.setCosmetic(false);
         pen.setCapStyle(Qt::RoundCap);
         pen.setJoinStyle(Qt::RoundJoin);
@@ -492,7 +506,7 @@ void CanvasWidget::mousePressEvent(QMouseEvent *event)
         m_drawing = true;
         m_currentStroke = Stroke{};
         m_currentStroke.color = Qt::white;
-        m_currentStroke.width = 2.0;
+        m_currentStroke.width = 2.0 / qMax<qreal>(m_zoom, 0.001);  // Constant width in world coordinates
         appendPointToCurrentStroke(worldPos);
         m_lastStrokeUpdateWorldRect = QRectF(worldPos, QSizeF(0, 0));
         grabMouse();
@@ -694,13 +708,13 @@ void CanvasWidget::paintEvent(QPaintEvent *)
         worldToScreen.translate(m_pan.x(), m_pan.y());
         worldToScreen.scale(m_zoom, m_zoom);
 
-        auto drawStroke = [&p, &worldToScreen](const Stroke &s) {
+        auto drawStroke = [this, &p, &worldToScreen](const Stroke &s) {
             if (s.points.size() < 2 || s.path.isEmpty()) {
                 return;
             }
 
             QPen pen(s.color);
-            pen.setWidthF(s.width);
+            pen.setWidthF(s.width * m_zoom);  // Scale width by zoom to maintain world-space width
             pen.setCosmetic(false);
             pen.setCapStyle(Qt::RoundCap);
             pen.setJoinStyle(Qt::RoundJoin);

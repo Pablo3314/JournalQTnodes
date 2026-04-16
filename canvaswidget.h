@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QWidget>
+#include <QKeyEvent>
 #include <QVector>
 #include <QHash>
 #include <QSet>
@@ -65,6 +66,14 @@ private:
     int m_nextStrokeId = 1;
     QTimer *m_metaSaveTimer = nullptr;
 
+    // Eraser state
+    bool m_eraserKeyHeld = false;
+    bool m_eraserButtonHeld = false;
+    qreal m_lastTabletPressure = 0.0;
+    QPointF m_pointerScreenPos;
+    bool m_pointerValid = false;
+    bool m_eraseDirty = false;
+
     static constexpr qreal GRID_SIZE = 1200.0;
     QHash<qint64, QVector<int>> m_gridIndex;
 
@@ -91,4 +100,14 @@ private:
     void invalidateCache();
     bool isCacheValid(const QRectF &visibleWorld) const;
     void renderStrokes(QPainter &p, const QRectF &visibleWorld);
+
+    QRect updateRectForWorld(const QRectF &worldRect) const;
+
+    bool isEraserButton(Qt::MouseButton button);
+    bool isAnyEraserButtonPressed(Qt::MouseButtons buttons);
+    bool isEraserMode() const;
+    qreal currentEraserRadiusPixels() const;
+    QVector<Stroke> eraseStrokeSegments(const Stroke &stroke, const QPointF &center, qreal radiusWorld, bool &changed) const;
+    bool eraseAt(const QPointF &worldCenter, qreal radiusWorld);
+    void rewriteAllStrokeFiles();
 };
